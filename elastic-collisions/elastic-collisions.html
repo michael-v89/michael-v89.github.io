@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <title>Elastic collisions</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>">
+
+  <style>
+    body { font-size: 12px; }
+    table { width: min-content; }
+    table td { vertical-align: top; padding: 0.33em; }
+    input { margin-bottom: 0.8em; }
+    #canvas { border: 1px solid #000; }
+  </style>
+</head>
+
+<body>
+  <table>
+    <tr>
+      <td>
+        <label for="atomSize">Atom size</label>
+        <input type="text" id="atomSize" />
+
+        <label for="numberOfAtoms">Number of atoms</label>
+        <input type="text" id="numberOfAtoms" />
+
+        <label for="startVelocity" title="module, direction">Start velocity</label>
+        <input type="text" id="startVelocity" />
+
+        <label for="gravity">Gravity</label>
+        <input type="text" id="gravity" />
+
+        <label for="picoSecondsPerSecond" title="Big time factor can cause incorrect collision processing">Time factor</label>
+        <input type="text" id="picoSecondsPerSecond" />
+
+        <label for="atomMassFrom" title="from, to">Atom mass</label>
+        <input type="text" id="atomMassFrom" />
+
+        <button id="startButton" data-switch-title="Stop">Start</button>
+        <button id="saveState" style="float: right">Save state</button>
+      </td>
+      <td>
+        <canvas id="canvas" width="800" height="400"></canvas>
+      </td>
+    </tr>
+  </table>
+
+  <script>
+
+    (function () {
+      const $ = (selector, parent) => (parent ?? document).querySelector(selector)
+
+      // units, just for clarity
+      const PM = 1
+      const PM_PER_PSEC = 1
+      const KG = 1
+      const RADIAN = 1
+
+      const ONE_ATOM_MASS = 1.66e-27*KG
+
+      // for simplicity and performance we assume that all atoms have the same radius
+      const ATOM_DIAMETER = 300*PM
+
+
+      const settings = {
+        atomSize: 10,
+        numberOfAtoms: 200,
+        startVelocity: 493*PM_PER_PSEC,
+        startDirection: 0,
+        gravity: 0,
+        atomMassFrom: 1,
+        atomMassTo: 1,
+        picoSecondsPerSecond: 30,
+      }
+      window.settings = settings
+
+
+      class App {
+        canvas
+        ctx
+        canvasWidth
+        canvasHeight
+
+        /** @var boolean */
+        running
+
+        startTime
+
+        /** @var {World} */
+        world
+        renderScale
+
+        mouseMoveEvent
+
+        run() {
+          this.canvas = $('#canvas')
+          this.ctx = this.canvas.getContext('2d')
+          this.canvasWidth = this.canvas.width
+          this.canvasHeight = this.canvas.height
+
+          this.ctx.lineWidth = 1
+          this.ctx.fillStyle = '#fff'
+
+          this.running = false
+
+          const search = new URLSearchParams(location.search)
+          const dataStr = search.get('d') ?? undefined
+          this.initWorld(dataStr)
+
+          this.initHandlers()
+
+          requestAnimationFrame((time) => {
+            this.startTime = time
+            requestAnimationFrame(this.step.bind(this))
+          })
+        }
+
+        initHandlers() {
+          for (const key of Object.keys(settings)) {
+            const el = $('#' + key)
+            if (el) {
+              el.value = settings[key].toString()
+
+              el.onkeydown = (event) => {
+                if (event.key === 'Enter') {
+                  el.onchange(event)
+                }
+              }
+            }
+          }
+
+          $('#startButton').onclick = (event) => {
+            this.running = !this.running
+
+            const thisButton = $('#startButton')
+            const text = thisButton.innerText
+            thisButton.innerHTML = thisButton.getAttribute('data-switch-title')
+            thisButton.setAttribute('data-switch-title', text)
+          }
+
+          $('body').onkeydown = (event) => {
+            if (event.target === document.body && event.key === 'Enter') {
+              $('#startButton').click()
+            }
+          }
+
+          $('#saveState').onclick = (e) => {
+            const params = {settings: settings, atomList: this.world.atomList.slice(0, 30)}
+            const url = new URL(location)
+            url.searchParams.set('d', JSON.stringify(params))
+            history.pushState(undefined, '', url)
+          }
+
+          $('#numberOfAtoms').onchange = () => {
+            settings.numberOfAtoms = parseInt($('#numberOfAtoms').value)
+            this.initWorld(undefined)
+            history.replaceState(null, null, ' ')
+          }
+
+          $('#atomSize').onchange = () => {
+            settings.atomSize = parseFloat($('#atomSize').value)
+            if (settings.atomSize <= 0.001) {
+              settings.atomSize = 1
+              $('#atomSize').value = '1'
+            }
+
+            this.initWorld()
+            history.replaceState(null, null, ' ')
+          }
+
+          $('#startVelocity').onchange = () => {
+            const value = $('#startVelocity').value.split(',')
+            settings.startVelocity = parseFloat(value[0])
+            settings.startDirection = parseFloat(value[1] ?? '0')
+          }
+
+          $('#gravity').onchange = () => {
+            settings.gravity = parseFloat($('#gravity').value)
+            this.world.setGravity(settings.gravity, settings.startVelocity)
+          }
+
+          $('#picoSecondsPerSecond').onchange = () => {
+            settings.picoSecondsPerSecond = parseFloat($('#picoSecondsPerSecond').value)
+          }
+
+          $('#atomMassFrom').onchange = () => {
+            const value = $('#atomMassFrom').value.split(',')
+            settings.atomMassFrom = parseFloat(value[0])
+            settings.atomMassTo = parseFloat(value[1] ?? value[0])
+
+            if (settings.atomMassFrom > settings.atomMassTo) {
+              settings.atomMassTo = settings.atomMassFrom
+              $('#atomMassFrom').value = settings.atomMassFrom.toString()
+            }
+          }
+
+          $('#canvas').onmousemove = (event) => {
+            if (event.buttons === 1) {
+              this.mouseMoveEvent = event
+            } else {
+              this.mouseMoveEvent = null
+            }
+          }
+
+          $('#canvas').onmouseup = (event) => {
+            this.mouseMoveEvent = null
+
+            const canvasX = event.offsetX
+            const canvasY = event.offsetY
+
+            let worldX = canvasX / this.renderScale
+            let worldY = (this.canvasHeight - canvasY) / this.renderScale
+
+            if (event.shiftKey) {
+              const [i, j] = this.world.getSpaceCoords(new Point(worldX, worldY))
+              const atomAtPos = this.world.space?.[i]?.[j] ?? undefined
+
+              if (atomAtPos) {
+                for (let i = 0; i < this.world.atomList.length; i++) {
+                  if (this.world.atomList[i] === atomAtPos) {
+                    this.world.clearAtomPlace(atomAtPos)
+                    this.world.atomList.splice(i, 1)
+                  }
+                }
+              }
+            } else {
+              const atom = this.createAtom(worldX, worldY, settings.startDirection * Math.PI / 180)
+              this.world.addAtom(atom)
+            }
+          }
+        }
+
+        /** @param {string | undefined} dataStr */
+        initWorld(dataStr) {
+          const atomDiameter = ATOM_DIAMETER * settings.atomSize
+
+          const world = new World(200000*PM, 100000*PM, settings.gravity, atomDiameter)
+          world.init()
+
+          if (dataStr !== undefined) {
+            const data = JSON.parse(dataStr)
+            Object.assign(settings, data.settings)
+            world.setGravity(settings.gravity, settings.startVelocity)
+
+            for (const atomData of data.atomList) {
+              const atom = new Atom(
+                  new Point(atomData.pos.x, atomData.pos.y),
+                  atomData.radius,
+                  atomData.mass,
+                  new Vector(atomData.velocity.x, atomData.velocity.y)
+              )
+              world.addAtom(atom)
+            }
+          }
+
+          for (let n = world.atomList.length; n < settings.numberOfAtoms; n++) {
+            const x = Math.random() * world.width
+            const y = Math.random() * world.height
+
+            const velocityDirection = Math.random() * 2*Math.PI*RADIAN
+
+            const atom = this.createAtom(x, y, velocityDirection)
+            world.addAtom(atom)
+          }
+
+          this.world = world
+          this.renderScale = this.canvasWidth / world.width
+        }
+
+        createAtom(x, y, velocityDirection, massCoef) {
+          const atomDiameter = ATOM_DIAMETER * settings.atomSize
+          const atomRadius = atomDiameter / 2
+
+          const velocityModule = settings.startVelocity
+          const velocityX = Math.cos(velocityDirection) * velocityModule
+          const velocityY = Math.sin(velocityDirection) * velocityModule
+
+          const pos = new Point(x, y)
+          const velocity = new Vector(velocityX, velocityY)
+          massCoef ??= settings.atomMassFrom + Math.random() * (settings.atomMassTo - settings.atomMassFrom)
+          const atomMass = 28*ONE_ATOM_MASS * massCoef
+
+          return new Atom(pos, atomRadius, atomMass, velocity)
+        }
+
+        step(time) {
+          if (this.running) {
+            let diffMs = (time - this.startTime)
+
+            // it's not called when window is not active
+            if (diffMs >= 120) diffMs = 1
+
+            const dtMs = 10
+            const stepTime = settings.picoSecondsPerSecond / 1000 * dtMs
+
+            // for correct work of gravity we need equal dt every time
+            let n
+            for (n = 0; n < diffMs; n += dtMs) {
+              this.world.calcStep(stepTime)
+            }
+
+            const remMs = diffMs - (n - dtMs)
+            this.startTime = time - remMs
+          }
+
+          this.render()
+          requestAnimationFrame(this.step.bind(this))
+        }
+
+        render() {
+          this.clearCanvas()
+
+          if (this.mouseMoveEvent) {
+            const canvasX = this.mouseMoveEvent.offsetX
+            const canvasY = this.mouseMoveEvent.offsetY
+
+            this.ctx.strokeStyle = '#aaa'
+            this.ctx.setLineDash([4, 6])
+            this.ctx.lineWidth = 1
+            this.ctx.beginPath()
+            this.ctx.moveTo(0, canvasY)
+            this.ctx.lineTo(this.canvasWidth, canvasY)
+            this.ctx.moveTo(canvasX, 0)
+            this.ctx.lineTo(canvasX, this.canvasHeight)
+            this.ctx.stroke()
+            this.ctx.setLineDash([])
+          }
+
+          for (let atom of this.world.atomList) {
+            this.renderAtom(atom)
+          }
+        }
+
+        clearCanvas() {
+          this.ctx.strokeStyle = '#000'
+          this.ctx.fillStyle = '#fff'
+          this.ctx.fillRect(0, 0, this.canvasWidth, this.canvasHeight)
+        }
+
+        /** @param {Atom} atom */
+        renderAtom(atom) {
+          const [canvasX, canvasY] = this.getCanvasCoords(atom.pos.x, atom.pos.y)
+
+          let canvasRadius = atom.radius * this.renderScale
+
+          const colorLevel = this.calcColorLevel(atom.velocity.module)
+          const color = this.calcColorByRange(
+            [0, 124, 248],
+            [160, 160, 160],
+            canvasRadius < 3 ? [248, 36, 36] : [240, 68, 68],
+            colorLevel,
+          )
+
+          // hotter ones are faster and not very noticeable on small scale,
+          // so we draw them bigger to make them more noticeable
+          if (colorLevel > 0 && canvasRadius < 3) canvasRadius += 1/3
+
+          this.drawCircle(canvasX, canvasY, canvasRadius, color)
+
+          if (canvasRadius >= 3) {
+            let arrowDx = atom.velocity.cos() * canvasRadius
+            let arrowDy = atom.velocity.sin() * canvasRadius
+
+            this.ctx.strokeStyle = '#fff'
+            this.ctx.beginPath()
+            this.ctx.moveTo(canvasX, canvasY)
+            this.ctx.lineTo(canvasX + arrowDx, canvasY - arrowDy)
+            this.ctx.stroke()
+          }
+        }
+
+        getCanvasCoords(x, y) {
+          const canvasX = x * this.renderScale
+          const canvasY = this.canvasHeight - y * this.renderScale
+
+          return [canvasX, canvasY]
+        }
+
+        calcColorLevel(velocity) {
+          const maxHotV = 800
+          const minHotV = 493
+
+          // -1..1
+          const colorLevel = velocity >= minHotV
+                  ? (velocity - minHotV) / (maxHotV - minHotV)
+                  : (velocity - minHotV) / (minHotV - 0)
+
+          return colorLevel
+        }
+
+        calcColorByRange(minColor, middleColor, maxColor, colorLevel) {
+          colorLevel = Math.min(Math.max(colorLevel, -1), 1)
+
+          const res = []
+          for (let i = 0; i < 3; i++) {
+            const minValue = minColor[i]
+            const middleValue = middleColor[i]
+            const maxValue = maxColor[i]
+
+            const color = colorLevel >= 0
+              ? middleValue + (maxValue - middleValue) * (colorLevel)
+              : middleValue - (middleValue - minValue) * (-colorLevel)
+
+            res.push(Math.floor(color))
+          }
+
+          return 'rgb(' + res.join(',') + ')'
+        }
+
+        drawCircle(x, y, r, color) {
+          this.ctx.strokeStyle = color
+          this.ctx.fillStyle = color
+
+          if (r < 1) {
+            this.ctx.strokeRect(x, y, 1, 1)
+          } else {
+            this.ctx.beginPath()
+            this.ctx.arc(x, y, r, 0, 2*Math.PI)
+            this.ctx.fill()
+          }
+        }
+      }
+
+      class Point {
+        constructor(x, y) {
+          this.x = x
+          this.y = y
+        }
+
+        add(x, y) {
+          this.x += x
+          this.y += y
+        }
+      }
+
+      class Vector {
+        constructor(x, y) {
+          this.x = 0
+          this.y = 0
+          this.add(x, y)
+        }
+
+        add(x, y) {
+          this.x += x
+          this.y += y
+          this.module = Math.sqrt(this.x * this.x + this.y * this.y)
+        }
+
+        cos() {
+          return this.module < 0.0000001 ? 1 : this.x / this.module
+        }
+
+        sin() {
+          return this.module < 0.0000001 ? 0 : this.y / this.module
+        }
+      }
+
+      class Atom {
+        /**
+         * @param {Point} position
+         * @param {number} radius
+         * @param {number} mass
+         * @param {Vector} velocity
+         */
+        constructor(position, radius, mass, velocity) {
+          this.pos = position
+          this.radius = radius
+          this.mass = mass
+          this.velocity = velocity
+        }
+      }
+
+      class World {
+        width
+        height
+        collisionQuantSize
+        gravity
+
+        /** @var {Atom[]} */
+        atomList
+
+        /** @var {(Atom|undefined)[][]} */
+        space
+
+        /**
+         * @param {number} width Abstract world width
+         * @param {number} height Abstract world height
+         * @param {number} gravity Gravity
+         * @param {number} collisionQuantSize Space quant size to get integer coords for rendering array
+         */
+        constructor(width, height, gravity, collisionQuantSize) {
+          this.width = width
+          this.height = height
+          this.collisionQuantSize = collisionQuantSize
+          this.gravity = gravity
+
+          this.init()
+        }
+
+        init() {
+          this.atomList = []
+
+          const [w, h] = this.getSpaceCoords(new Point(this.width + this.collisionQuantSize, this.height + this.collisionQuantSize))
+
+          this.space = []
+          this.space.length = w
+          for (let i = 0; i < w; i++) {
+            this.space[i] = []
+            this.space[i].length = h
+            this.space[i].fill(undefined)
+          }
+        }
+
+        setGravity(gravity, startVelocity) {
+          this.gravity = gravity
+
+          for (const atom of this.atomList) {
+            // same direction, new module
+            const cos = atom.velocity.cos()
+            const sin = atom.velocity.sin()
+            atom.velocity.add(-atom.velocity.x, -atom.velocity.y)
+            atom.velocity.add(startVelocity * cos, startVelocity * sin)
+          }
+        }
+
+        /**
+         * @param {Point} point
+         * @returns {[number, number]} Integer coords in space array
+         */
+        getSpaceCoords(point) {
+          const x = Math.floor(point.x / this.collisionQuantSize /* - 1/2 */)
+          const y = Math.floor(point.y / this.collisionQuantSize /* - 1/2 */)
+
+          return [x, y]
+        }
+
+        /** @param {Atom} atom */
+        addAtom(atom) {
+          atom.pos.x = Math.min(Math.max(atom.pos.x, atom.radius), this.width - atom.radius * 2)
+          atom.pos.y = Math.min(Math.max(atom.pos.y, atom.radius), this.height - atom.radius * 2)
+
+          let hasCollisions
+          do {
+            hasCollisions = false
+            for (const existingAtom of this.atomList) {
+              const dx = existingAtom.pos.x - atom.pos.x
+              const dy = existingAtom.pos.y - atom.pos.y
+              const distance = Math.sqrt(dx*dx + dy*dy)
+
+              const minNoIntersectionDistance = existingAtom.radius + atom.radius
+              if (distance < minNoIntersectionDistance) {
+                atom.pos.add(0, existingAtom.radius + atom.radius)
+                hasCollisions = true
+                break
+              }
+            }
+
+            if (atom.pos.y >= this.height) {
+              // if we cannot place, just skip it
+              break
+            }
+          } while (hasCollisions)
+
+          if (!hasCollisions) {
+            this.atomList.push(atom)
+            this.placeAtom(atom)
+          }
+        }
+
+        /** @param {Atom} atom */
+        placeAtom(atom) {
+          // we assume that all atoms have same radius for performance
+          // with different radius we would need to render circles
+          const [i, j] = this.getSpaceCoords(atom.pos)
+          this.space[i][j] = atom
+        }
+
+        /** @param {Atom} atom */
+        clearAtomPlace(atom) {
+          const [i, j] = this.getSpaceCoords(atom.pos)
+          this.space[i][j] = undefined
+        }
+
+        calcStep(dt) {
+          for (let atom of this.atomList) {
+            atom.velocity.add(0, -this.gravity * dt)
+          }
+
+          for (let atom of this.atomList) {
+            this.moveAtom(atom, dt)
+          }
+
+          for (let atom of this.atomList) {
+            this.processCollisions(atom)
+          }
+        }
+
+        /**
+         * @param {Atom} atom
+         * @param {number} dt
+         */
+        moveAtom(atom, dt) {
+          this.clearAtomPlace(atom)
+
+          atom.pos.add(atom.velocity.x * dt, atom.velocity.y * dt)
+
+          this.processCollisionWithWalls(atom)
+
+          this.placeAtom(atom)
+        }
+
+        /** @param {Atom} atom */
+        processCollisionWithWalls(atom) {
+          if (atom.pos.x > this.width - atom.radius) {
+            atom.pos.add(-2*(atom.pos.x - (this.width - atom.radius)), 0)
+            atom.velocity.add(-2*atom.velocity.x, 0)
+          }
+
+          if (atom.pos.y > this.height - atom.radius) {
+            atom.pos.add(0, -2*(atom.pos.y - (this.height - atom.radius)), 0)
+            atom.velocity.add(0, -2*atom.velocity.y)
+          }
+
+          if (atom.pos.x <= atom.radius) {
+            atom.pos.add(-2*(atom.pos.x - (0 + atom.radius)), 0)
+            atom.velocity.add(-2*atom.velocity.x, 0)
+          }
+
+          if (atom.pos.y <= atom.radius) {
+            atom.pos.add(0, -2*(atom.pos.y - (0 + atom.radius)), 0)
+            atom.velocity.add(0, -2*atom.velocity.y)
+          }
+        }
+
+        /** @param {Atom} atom */
+        processCollisions(atom) {
+          const possibleCollisions = this.getPossibleCollisions(atom)
+
+          for (let neighborAtom of possibleCollisions) {
+            this.processCollision(atom, neighborAtom)
+          }
+        }
+
+        /**
+         * @param {Atom} atom
+         * @return {Atom[]}
+         */
+        getPossibleCollisions(atom) {
+          const res = []
+          const [x, y] = this.getSpaceCoords(atom.pos)
+
+          let neighborAtom
+          for (let i = -1; i <= 1; i++) {
+            for (let j = -1; j <= 1; j++) {
+              neighborAtom = this.space?.[x + i]?.[y + j] ?? undefined
+              if (neighborAtom !== undefined && neighborAtom !== atom) res.push(neighborAtom)
+            }
+          }
+
+          return res
+        }
+
+        /**
+         *  @param {Atom} atom1
+         *  @param {Atom} atom2
+         */
+        processCollision(atom1, atom2) {
+          // vector from atom1 to atom2
+          const dx = atom2.pos.x - atom1.pos.x
+          const dy = atom2.pos.y - atom1.pos.y
+          const distance = Math.sqrt(dx*dx + dy*dy)
+
+          const minNoIntersectionDistance = atom1.radius + atom2.radius
+          if (distance >= minNoIntersectionDistance) return
+
+          // cos and sin of vector angle
+          const cosA = dx / distance
+          const sinA = dy / distance
+
+          // relative velocity
+          const dvx = atom1.velocity.x - atom2.velocity.x
+          const dvy = atom1.velocity.y - atom2.velocity.y
+
+          // relative velocity to normal
+          const dvn = dvx * cosA + dvy * sinA
+
+          // if atoms go to opposite directions, there is no collision
+          // NOTE: for negative time the equality sign should be opposite
+          if (dvn < 0) return
+
+          // impulse of elastic collision
+          const impulseCoef = (2 * dvn) / (atom1.mass + atom2.mass)
+
+          // update velocities
+          const dvx1 = -impulseCoef * atom2.mass * cosA
+          const dvy1 = -impulseCoef * atom2.mass * sinA
+          const dvx2 = impulseCoef * atom1.mass * cosA
+          const dvy2 = impulseCoef * atom1.mass * sinA
+
+          atom1.velocity.add(dvx1, dvy1)
+          atom2.velocity.add(dvx2, dvy2)
+        }
+      }
+
+      window.app = new App()
+      window.app.run()
+    }())
+
+  </script>
+</body>
+
+</html>
